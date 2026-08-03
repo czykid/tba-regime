@@ -271,7 +271,71 @@ def kalman_tvp(y, x, q_init=1e-6, estimate=True):
     }
 
 
-def innovation_cusum(z, a=0.948, burn=60):
+def empirical_shewhart_threshold(z, cal, burn=60):
+    """Threshold for |z| flags, calibrated to the data's OWN tail rather than
+    a Gaussian convention. Trailing quantile => self-adjusting to residual
+    leptokurtosis: if innovations are t-like, a fixed 3.5 fires ~10x more
+    often than its nominal rate, while the quantile holds the DESIGNED alarm
+    rate whatever the tail shape. Trailing (not full-sample) keeps it PIT.
+    Returns (threshold_series, mode_used)."""
+    zz = z.iloc[burn:].abs()
+    if cal.get("shewhart_mode") != "empirical" or \
+            len(zz) < cal.get("shewhart_min_window", 250):
+        return pd.Series(cal.get("shewhart_fixed", 3.5), index=z.index), "fixed"
+    w = cal.get("shewhart_window", 500)
+    q = cal.get("shewhart_quantile", 0.998)
+    thr = zz.rolling(w, min_periods=cal.get("shewhart_min_window", 250)) \
+            .quantile(q).shift(1)
+    thr = thr.reindex(z.index).ffill().fillna(cal.get("shewhart_fixed", 3.5))
+    return thr, "empirical"
+
+
+def calibrate_pelt_penalty(series, cal, min_size, model="l2", seed=0):
+    """Choose the PELT penalty by SIMULATING THE NULL instead of trusting
+    pen = c*log(T). Circular-block bootstrap destroys any break structure
+    while preserving the serial correlation (critical: 60d rolling betas are
+    ~59/60 overlapping, so an uncalibrated penalty over-detects wildly).
+    Returns the smallest penalty whose family-wise false-alarm rate is at or
+    below target -- smallest because that maximizes power subject to the
+    error constraint. Also returns the achieved rate for the report."""
+    import ruptures as rpt
+    s = pd.Series(series).dropna()
+    T = len(s)
+    if cal.get("pelt_mode") != "empirical" or T < 4 * min_size:
+        return None, None, "fixed"
+    z = ((s - s.mean()) / (s.std() + 1e-12)).values
+    rng = np.random.default_rng(seed)
+    B = cal.get("pelt_boot_B", 99)
+    block = max(min_size // 2, 20)
+    grid = sorted(cal.get("pelt_pen_grid", [1.0, 2.0, 3.0, 6.0]))
+    counts = {p: 0 for p in grid}
+    # coarse-to-fine: once a replicate is clean at penalty p it is clean at
+    # every larger p (PELT is monotone in the penalty), so ascend the grid
+    # and stop at the first clean level for that replicate.
+    for _ in range(B):
+        idx = _block_boot_idx(T, block, rng)
+        xb = z[idx].reshape(-1, 1)
+        try:
+            algo = rpt.Pelt(model=model, min_size=min_size,
+                            jump=cal.get("jump", 5)).fit(xb)
+        except Exception:
+            continue
+        for p in grid:
+            try:
+                if len(algo.predict(pen=p * np.log(T))) - 1 > 0:
+                    counts[p] += 1
+                else:
+                    break   # monotone: all larger penalties also clean
+            except Exception:
+                pass
+    target = cal.get("pelt_target_fa", 0.05)
+    rates = {p: counts[p] / max(B, 1) for p in grid}
+    ok = [p for p in grid if rates[p] <= target]
+    chosen = min(ok) if ok else max(grid)
+    return chosen, rates.get(chosen), "empirical"
+
+
+def innovation_cusum(z, a=0.948, burn=60, threshold=None):
     """CUSUM and CUSUM-of-squares of standardized Kalman innovations.
     Persistent excursions = the linear-Gaussian description broke."""
     z = z.iloc[burn:]
@@ -288,6 +352,10 @@ def innovation_cusum(z, a=0.948, burn=60):
     # for these series, hence 'stat' is reported alongside the date).
     it_stat = float(np.sqrt(T / 2.0) * dev.max())
     sq_date = z.index[int(np.argmax(dev))]
+    thr = threshold if threshold is not None else 3.5
+    thr_al = (thr.reindex(z.index) if hasattr(thr, "reindex")
+              else pd.Series(thr, index=z.index))
+    flag_mask = (np.abs(z) > thr_al).fillna(False).values
     return {
         "cusum": pd.Series(c.values, index=z.index),
         "band": band,
@@ -295,7 +363,10 @@ def innovation_cusum(z, a=0.948, burn=60):
         "cusum_sq": pd.Series(csq.values, index=z.index),
         "sq_break_date": sq_date,
         "sq_it_stat": it_stat,
-        "shewhart_dates": list(z.index[np.abs(z) > 3.5]),
+        "shewhart_dates": list(z.index[flag_mask]),
+        "shewhart_threshold_used": (float(thr.iloc[-1])
+                                    if hasattr(thr, "iloc") else float(thr)),
+        "shewhart_realized_rate": float(flag_mask.mean()),
     }
 
 

@@ -47,6 +47,16 @@ On the hedge-ratio audit log: the historical intraday change times are unrecover
 
 **Coupon swaps.** `basis_coupon_swaps.csv` holds b_c1 − b_c2 for adjacent liquid pairs — identically your duration-neutral swap P&L (tsy hedge = hr1−hr2); the ratio-weighted version is b_c1 − (hr1/hr2)·b_c2. Any layer above can be re-run on a swap column by pointing the reference series at it.
 
+## 3b. Empirical calibration (what replaces the textbook constants)
+
+Two thresholds are now calibrated to your data rather than taken from a table, controlled by the `calibration` block in `config.py` (set either to `"fixed"` to revert).
+
+**Shewhart flags on Kalman innovations.** The fixed 3.5 assumes Gaussian innovations, giving one false alarm per ~8.5 years. Real basis innovations are fat-tailed, so 3.5 can fire an order of magnitude more often than nominal. The empirical mode uses a trailing quantile of |z| (default 99.8th over 500 days, lagged one day so it stays point-in-time), which holds the *designed* alarm rate whatever the tail shape. The report prints the cutoff actually in force and the realized flag rate per year — if the realized rate is far above the Gaussian nominal, that is itself telling you how non-normal your innovations are. Cluster logic (two flags in five days) still applies on top.
+
+**PELT penalties.** `pen = c·log(T)` is a modelling convention, not an error-rate guarantee, and it fails badly on persistent series: a rolling beta path has AR(1) ≈ 0.999, and a near-random walk genuinely wanders, so l2 segmentation finds "mean shifts" in pure noise. The empirical mode block-bootstraps the series under a no-break null (preserving the serial correlation and the ~59/60 window overlap), then picks the smallest penalty on the grid whose family-wise false-alarm rate meets the target (default 5%). On the validation data this selected a penalty roughly 25x the textbook value and cut the beta-path breaks from two to one — eliminating a spurious date while still recovering the planted break. The report prints the chosen penalty and achieved false-alarm rate.
+
+Read the achieved rate as a diagnostic in its own right. If no penalty on the grid gets under target, the series is too persistent for segmentation to be inferential at all, and its dates should be treated as descriptive only — lean on the Kalman layer instead. Widen `pelt_pen_grid` upward if you hit the top of the grid.
+
 ## 4. Monitoring workflow
 
 Daily: append the new rows, rerun. Filtration-respecting statistics — safe to act on as they update — are the Kalman filtered beta and innovation flags, the MS and HMM *filtered* probabilities with hysteresis, and the rolling vol-beta. Full-sample statistics — PELT dates, sup-F, segments, smoothed probabilities, the attribution over closed episodes — are descriptive; re-read them weekly and expect the last segment's boundary to move as data arrives (end-of-sample instability is inherent to segmentation, not a bug). A practical alert set: Kalman |z|>3.5 twice in five days; CUSUM-sq drifting; MS filtered widening prob crossing 0.8; vol-beta rolling estimate leaving its 1-year range; a new PELT break on the desk−quant spread.

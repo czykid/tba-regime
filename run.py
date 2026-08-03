@@ -122,6 +122,7 @@ def main(mode, data_dir=None):
         print(f"[data] loaded {data_dir}: {len(data['dates'])} days, "
               f"{data['tba_front'].shape[1]} coupons")
 
+    cal = cfg["calibration"]
     front, back = data["tba_front"], data["tba_back"]
     coupons = list(front.columns)
     report = ["# TBA basis regime pipeline -- run report\n"]
@@ -299,9 +300,12 @@ def main(mode, data_dir=None):
 
     # ---- PELT on the beta path (respecting overlap) ----
     beta_path = hres["fit_B"][0.0]
+    pen_beta, fa_beta, pen_mode = regimes.calibrate_pelt_penalty(
+        beta_path, cal, cfg["regimes"]["pelt_min_size"], model="l2")
+    pen_beta = pen_beta if pen_beta is not None else cfg["regimes"]["pelt_pen_scale"]
     pelt_beta = regimes.pelt_breaks(beta_path, beta_path.index, model="l2",
                                     min_size=cfg["regimes"]["pelt_min_size"],
-                                    pen_scale=cfg["regimes"]["pelt_pen_scale"])
+                                    pen_scale=pen_beta)
     pelt_basis = regimes.pelt_breaks(b_cc, b_cc.index, model="rbf",
                                      min_size=cfg["regimes"]["pelt_min_size"],
                                      pen_scale=cfg["regimes"]["pelt_pen_scale"])
@@ -312,6 +316,13 @@ def main(mode, data_dir=None):
                                    min_size=cfg["regimes"]["pelt_min_size"],
                                    pen_scale=2.0)
     report.append(f"### PELT multiple-break dates")
+    if pen_mode == "empirical":
+        report.append(f"- Penalty calibrated by null bootstrap: "
+                      f"pen_scale={pen_beta} (achieved false-alarm rate "
+                      f"{fa_beta:.1%} vs {cal['pelt_target_fa']:.0%} target). "
+                      f"This replaces the textbook c*log(T): the null "
+                      f"bootstrap preserves the ~59/60 window overlap that "
+                      f"makes uncalibrated penalties over-detect.")
     report.append(f"- beta_B(cc) mean shifts: {[d.date() for d in pelt_beta]}")
     if data.get("tsy_roll_dates") is not None and len(pelt_beta):
         near_tsy = [d.date() for d in pelt_beta
@@ -340,7 +351,11 @@ def main(mode, data_dir=None):
     # ---- Kalman TVP + innovation CUSUM (the online detector) ----
     print("[regimes] Kalman TVP beta (MLE)...")
     kal = regimes.kalman_tvp(dfh["y"], dfh["x"], q_init=cfg["regimes"]["kalman_q_init"])
-    ic = regimes.innovation_cusum(kal["z"], a=cfg["regimes"]["cusum_alpha_a"])
+    thr_series, thr_mode = regimes.empirical_shewhart_threshold(
+        kal["z"], cal, burn=cfg["regimes"]["kalman_burn"])
+    ic = regimes.innovation_cusum(kal["z"], a=cfg["regimes"]["cusum_alpha_a"],
+                                  burn=cfg["regimes"]["kalman_burn"],
+                                  threshold=thr_series)
     report.append("### Kalman time-varying beta")
     report.append(f"- MLE: r={kal['r']:.2e}, q_alpha={kal['q_a']:.2e}, "
                   f"q_beta={kal['q_b']:.2e} (beta half-life of shocks "
@@ -350,7 +365,14 @@ def main(mode, data_dir=None):
                   f"{fe1.date() if fe1 is not None else 'never'}; CUSUM-sq "
                   f"argmax {ic['sq_break_date'].date()} (IT stat "
                   f"{ic['sq_it_stat']:.2f}, 5% iid crit ~1.36)")
-    report.append(f"- |z|>3.5 dates (first 8): "
+    report.append(f"- Shewhart threshold: {thr_mode} "
+                  f"(latest |z| cutoff {ic['shewhart_threshold_used']:.2f}; "
+                  f"realized flag rate {ic['shewhart_realized_rate']:.4%} "
+                  f"= {ic['shewhart_realized_rate']*252:.2f}/yr). Gaussian "
+                  f"3.5 would nominally give 0.12/yr -- a much higher "
+                  f"realized rate means the innovations are fat-tailed, "
+                  f"which is exactly why the threshold is data-calibrated.")
+    report.append(f"- flag dates (first 8): "
                   f"{[d.date() for d in ic['shewhart_dates'][:8]]}\n")
     kal["beta"].to_csv(f"{out}/kalman_beta.csv")
 

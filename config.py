@@ -34,6 +34,19 @@ CONFIG = {
         "hmm_seeds": [0, 1, 2, 3, 4],
         "hmm_min_prob": 0.8,       # hysteresis: enter state at 0.8, exit at 0.2 (filtered prob)
         "vol_beta_window": 60,     # rolling window for basis-on-dVol beta
+        "min_obs_frac": 0.75,      # min_periods as fraction of rolling window
+        "kalman_init_window": 60,  # OLS burn-in for Kalman state init
+        "kalman_burn": 60,         # innovations discarded before CUSUM
+        "pelt_jump": 5,            # ruptures grid stride (speed/resolution)
+        "hmm_train_frac": 0.6,     # HMM params fit on this leading fraction
+        "hmm_winsor_z": 5.0,       # clip standardized features (outlier states)
+        "hmm_state_min_freq": 0.02,# ignore degenerate states when picking stress
+        "min_obs_break_test": 120, # min sample for sup-F / Nyblom
+        "min_obs_kalman": 150,
+        "desk_xcorr_max_lag": 10,
+        "desk_trigger_thresholds": [0.05, 0.10, 0.14, 0.18],
+        "hedge_lag_artifact_days": 75,  # basis break within N days of beta break
+        "tsy_roll_proximity_days": 5,   # DV01-step caution window
     },
 
     # ---------------- forecast harness ----------------
@@ -74,6 +87,29 @@ CONFIG = {
         "pelt_pen_scale": 2.0,
         "widen_tstat": -1.0,     # segment labelled widening below this t
         "cycle_days": 21,        # roll-cycle amortization for carry proxy
+        "studentize_window": 60, # trailing sigma window for vol-studentization
+        "pelt_jump": 2,
+        "lam_window": 250,       # trailing window for basis-on-dVol loading
+        "cc_sens": 0.9,          # dCC/dy assumption in the convexity term
+        "event_pre_days": 5,
+        "event_post_days": 15,
+        "settle_days": 30,       # days-to-settle in the carry/specialness proxy
+    },
+
+    # ---------------- empirical calibration ----------------
+    # Replaces textbook constants with thresholds calibrated to YOUR data's
+    # own tails / null behaviour. Each has a "fixed" fallback.
+    "calibration": {
+        "shewhart_mode": "empirical",   # 'empirical' | 'fixed'
+        "shewhart_fixed": 3.5,          # Gaussian-convention fallback
+        "shewhart_quantile": 0.998,     # trailing quantile of |z| (~1/2yr)
+        "shewhart_window": 500,         # trailing obs for the quantile
+        "shewhart_min_window": 250,     # below this, use fixed
+        "pelt_mode": "empirical",       # 'empirical' | 'fixed'
+        "pelt_target_fa": 0.05,         # P(>=1 spurious break) under the null
+        "pelt_boot_B": 40,              # bootstrap reps (penalty search is O(B*|grid|))
+        "pelt_pen_grid": [1.0, 2.0, 3.0, 6.0, 12.0, 20.0, 40.0, 80.0, 160.0],
+        "report_realized_rates": True,  # print achieved exceedance rates
     },
 
     "outdir": "outputs",
