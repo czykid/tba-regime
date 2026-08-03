@@ -219,15 +219,19 @@ def main(mode, data_dir=None):
     b_cc.to_csv(f"{out}/basis_cc_node.csv")
     drop.to_csv(f"{out}/drop_by_coupon.csv")
     if data.get("repo") is not None:
-        implied, spec = basis_mod.carry_columns(drop, data["repo"], cc)
+        implied, spec = basis_mod.carry_columns(
+            drop, data["repo"], cc, days_to_settle=cfg["drift"]["settle_days"])
         spec.to_csv(f"{out}/specialness_proxy.csv")
 
     # ---- desk diagnostics ----
     desk = data.get("desk_ratio")
     if desk is not None and dYield is not None:
         print("[desk] reactivity + slippage diagnostics...")
-        xcorr, frac_static = basis_mod.desk_reactivity(desk, dYield)
-        trig, base_rate = basis_mod.update_trigger_profile(desk, data["tsy_yield"])
+        xcorr, frac_static = basis_mod.desk_reactivity(
+            desk, dYield, max_lag=cfg["regimes"]["desk_xcorr_max_lag"])
+        trig, base_rate = basis_mod.update_trigger_profile(
+            desk, data["tsy_yield"],
+            thresholds=cfg["regimes"]["desk_trigger_thresholds"])
         slip, spread = basis_mod.hedge_slippage(dP, dTsy, ratio_q, desk)
         report.append("## Desk vs quant\n")
         report.append(f"- Desk ratio unchanged on {frac_static:.1%} of days "
@@ -236,9 +240,23 @@ def main(mode, data_dir=None):
         for x, p in trig.items():
             report.append(f"    - >{x*100:.0f}bp: {p:.1%}")
         peak = xcorr.idxmax()
+        # Read the conclusion off the peak instead of asserting it: lag 0 is
+        # same-day response, not evidence of a lag, and a flat profile is not
+        # evidence of anything.
+        rng_x = float(xcorr.max() - xcorr.min())
+        if rng_x < 0.05:
+            verdict = ("no clear timing signature -- the profile is flat "
+                       "across lags, so this does not distinguish reactive "
+                       "from forward-looking")
+        elif peak == 0:
+            verdict = ("same-day response: the desk moves with the market, "
+                       "not after it")
+        else:
+            verdict = (f"reactive -- updates follow rate moves by ~{peak} "
+                       f"day(s), not forward-looking")
         report.append(f"- Update-vs-|rate-move| xcorr peaks at lag {peak} "
-                      f"days (corr {xcorr.max():.2f}) -> reactive, not "
-                      f"forward-looking.")
+                      f"days (corr {xcorr.max():.2f}, range across lags "
+                      f"{rng_x:.2f}) -> {verdict}.")
         report.append(f"- Mean |desk - quantB| ratio spread: "
                       f"{spread.abs().mean().mean():.3f}; slippage PnL sd "
                       f"{slip.std().mean():.4f}/day. Break tests on the spread "
@@ -253,7 +271,8 @@ def main(mode, data_dir=None):
         spread_breaks = regimes.pelt_breaks(spread.mean(axis=1), spread.index,
                                             model="l2",
                                             min_size=cfg["regimes"]["pelt_min_size"],
-                                            pen_scale=cfg["regimes"]["pelt_pen_scale"])
+                                            pen_scale=cfg["regimes"]["pelt_pen_scale"],
+                                            jump=cfg["regimes"]["pelt_jump"])
         report.append(f"- PELT breaks in desk-quant spread: "
                       f"{[d.date() for d in spread_breaks]}\n")
     else:
@@ -261,9 +280,18 @@ def main(mode, data_dir=None):
         report.append("## Desk vs quant\nDesk ratios not supplied -- skipped.\n")
 
     # ---- pick reference coupon: nearest to CC on average with coverage ----
+    # MEAN OF |m|, not |mean of m|: the latter lets a coupon that sits +100bp
+    # for half the sample and -100bp for the other half score 0 -- ranked
+    # "nearest" ahead of one that stays a steady 30bp away, when in fact it is
+    # never near CC at all.
     cov = dP.notna().mean()
-    avg_m = {c: abs((c - cc).mean()) for c in coupons}
-    ref = min([c for c in coupons if cov[c] > 0.7], key=lambda c: avg_m[c])
+    avg_m = {c: float((c - cc).abs().mean()) for c in coupons}
+    elig = [c for c in coupons if cov[c] > 0.7]
+    if not elig:
+        elig = [max(coupons, key=lambda c: cov[c])]
+        print(f"[warn] no coupon has >70% coverage; falling back to {elig[0]} "
+              f"({cov[elig[0]]:.0%})")
+    ref = min(elig, key=lambda c: avg_m[c])
     y_ref = dP[ref]
     print(f"[regimes] reference coupon {ref} (best coverage nearest CC)")
     report.append(f"## Regime battery (reference coupon {ref}, CC node)\n")
@@ -284,12 +312,15 @@ def main(mode, data_dir=None):
     sf = regimes.sup_f_bootstrap(dfh["y"].values, dfh["x"].values,
                                  trim=cfg["regimes"]["supF_trim"],
                                  B=cfg["regimes"]["boot_B"],
-                                 block=cfg["regimes"]["boot_block"])
+                                 block=cfg["regimes"]["boot_block"],
+                                 min_obs=cfg["regimes"]["min_obs_break_test"])
     sf_date = dfh.index[sf["break_idx"]] if sf.get("break_idx") is not None else None
     ny = regimes.nyblom_bootstrap(dfh["y"].values, dfh["x"].values,
                                   B=cfg["regimes"]["boot_B"],
-                                  block=cfg["regimes"]["boot_block"])
-    cu = regimes.cusum_recursive(dfh["y"], dfh["x"])
+                                  block=cfg["regimes"]["boot_block"],
+                                  min_obs=cfg["regimes"]["min_obs_break_test"])
+    cu = regimes.cusum_recursive(dfh["y"], dfh["x"],
+                                 min_obs=cfg["regimes"]["min_obs_kalman"])
     report.append("### Hedge-regression stability (dP_ref ~ dTsy)")
     report.append(f"- sup-F = {sf['supF']:.1f}, bootstrap p = {sf['p']:.3f}, "
                   f"argmax break ~ {sf_date.date() if sf_date is not None else 'n/a'}")
@@ -300,36 +331,57 @@ def main(mode, data_dir=None):
 
     # ---- PELT on the beta path (respecting overlap) ----
     beta_path = hres["fit_B"][0.0]
-    pen_beta, fa_beta, pen_mode = regimes.calibrate_pelt_penalty(
-        beta_path, cal, cfg["regimes"]["pelt_min_size"], model="l2")
+    pelt_jump = cfg["regimes"]["pelt_jump"]
+    if cal.get("pelt_mode") == "empirical":
+        print(f"[regimes] calibrating PELT penalty by null bootstrap "
+              f"(B={cal['pelt_boot_B']}, this is the slow step)...")
+    pen_beta, fa_beta, pen_mode, pen_diag = regimes.calibrate_pelt_penalty(
+        beta_path, cal, cfg["regimes"]["pelt_min_size"], model="l2",
+        jump=pelt_jump)
     pen_beta = pen_beta if pen_beta is not None else cfg["regimes"]["pelt_pen_scale"]
     pelt_beta = regimes.pelt_breaks(beta_path, beta_path.index, model="l2",
                                     min_size=cfg["regimes"]["pelt_min_size"],
-                                    pen_scale=pen_beta)
+                                    pen_scale=pen_beta, jump=pelt_jump)
     pelt_basis = regimes.pelt_breaks(b_cc, b_cc.index, model="rbf",
                                      min_size=cfg["regimes"]["pelt_min_size"],
-                                     pen_scale=cfg["regimes"]["pelt_pen_scale"])
+                                     pen_scale=cfg["regimes"]["pelt_pen_scale"],
+                                     jump=pelt_jump)
     # variance specialist: rbf saturates on the single most dramatic
     # distributional event; l2 on squared demeaned returns targets vol shifts
     b_dm = b_cc - b_cc.mean()
     pelt_var = regimes.pelt_breaks(b_dm ** 2, b_cc.index, model="l2",
                                    min_size=cfg["regimes"]["pelt_min_size"],
-                                   pen_scale=2.0)
+                                   pen_scale=2.0, jump=pelt_jump)
     report.append(f"### PELT multiple-break dates")
     if pen_mode == "empirical":
-        report.append(f"- Penalty calibrated by null bootstrap: "
-                      f"pen_scale={pen_beta} (achieved false-alarm rate "
-                      f"{fa_beta:.1%} vs {cal['pelt_target_fa']:.0%} target). "
-                      f"This replaces the textbook c*log(T): the null "
-                      f"bootstrap preserves the ~59/60 window overlap that "
-                      f"makes uncalibrated penalties over-detect.")
+        report.append(
+            f"- **beta path only**: penalty calibrated by null bootstrap to "
+            f"pen_scale={pen_beta} (achieved false-alarm rate {fa_beta:.1%} "
+            f"vs {cal['pelt_target_fa']:.0%} target, +/-{pen_diag['se']:.1%} "
+            f"MC error on {pen_diag['n_ok']} replicates). Null = "
+            f"'{pen_diag['null']}' with residual blocks of "
+            f"{pen_diag['block']}d, which estimates the beta path's "
+            f"persistence rather than assuming it: resampling LEVELS would "
+            f"splice unrelated levels (every seam a real mean shift), while "
+            f"differencing would impose an exact unit root. The other PELT "
+            f"lines below still use the uncalibrated "
+            f"pen_scale={cfg['regimes']['pelt_pen_scale']}.")
+        if pen_diag.get("at_grid_top"):
+            report.append(
+                f"- **CAUTION**: no penalty on the grid reached the "
+                f"{cal['pelt_target_fa']:.0%} target, so the top of the grid "
+                f"was used and the true false-alarm rate is ABOVE target. "
+                f"This series may be too persistent for segmentation to be "
+                f"inferential at all -- treat its dates as descriptive and "
+                f"lean on the Kalman layer. Widen pelt_pen_grid upward.")
     report.append(f"- beta_B(cc) mean shifts: {[d.date() for d in pelt_beta]}")
+    prox = cfg["regimes"]["tsy_roll_proximity_days"]
     if data.get("tsy_roll_dates") is not None and len(pelt_beta):
         near_tsy = [d.date() for d in pelt_beta
                     if min(abs((d - rr).days)
-                           for rr in data["tsy_roll_dates"]) <= 5]
+                           for rr in data["tsy_roll_dates"]) <= prox]
         if near_tsy:
-            report.append(f"- CAUTION: {near_tsy} fall within 5 days of an "
+            report.append(f"- CAUTION: {near_tsy} fall within {prox} days of an "
                           f"on-the-run switch -> candidate hedge-leg DV01 "
                           f"steps (new note's different coupon/maturity), "
                           f"not TBA duration regimes.")
@@ -338,8 +390,9 @@ def main(mode, data_dir=None):
     # hedge-lag artifact check: a basis break within ~45d after a beta break
     # is likely leaked rate beta while the 60d rolling hedge catches up,
     # NOT an independent basis regime
+    lag_win = cfg["regimes"]["hedge_lag_artifact_days"]
     artifacts = [d for d in (pelt_basis + pelt_var)
-                 for db in pelt_beta if 0 <= (d - db).days <= 75]
+                 for db in pelt_beta if 0 <= (d - db).days <= lag_win]
     if artifacts:
         report.append(f"- NOTE: {sorted(set(d.date() for d in artifacts))} occur "
                       f"just after detected beta breaks -> likely hedge-"
@@ -350,12 +403,20 @@ def main(mode, data_dir=None):
 
     # ---- Kalman TVP + innovation CUSUM (the online detector) ----
     print("[regimes] Kalman TVP beta (MLE)...")
-    kal = regimes.kalman_tvp(dfh["y"], dfh["x"], q_init=cfg["regimes"]["kalman_q_init"])
-    thr_series, thr_mode = regimes.empirical_shewhart_threshold(
+    kal = regimes.kalman_tvp(dfh["y"], dfh["x"],
+                             q_init=cfg["regimes"]["kalman_q_init"],
+                             init_window=cfg["regimes"]["kalman_init_window"],
+                             min_obs=cfg["regimes"]["min_obs_kalman"])
+    thr_series, thr_mode, thr_diag = regimes.empirical_shewhart_threshold(
         kal["z"], cal, burn=cfg["regimes"]["kalman_burn"])
     ic = regimes.innovation_cusum(kal["z"], a=cfg["regimes"]["cusum_alpha_a"],
                                   burn=cfg["regimes"]["kalman_burn"],
                                   threshold=thr_series)
+    # What the Gaussian-derived cutoff would ACTUALLY have fired at, in-sample.
+    # Unlike the realized rate under the calibrated threshold, this one is free
+    # to differ from the design -- so it does carry tail information.
+    _zb = kal["z"].iloc[cfg["regimes"]["kalman_burn"]:].abs()
+    fixed_rate_realized = float((_zb > thr_diag["gauss_cutoff"]).mean() * 252)
     report.append("### Kalman time-varying beta")
     report.append(f"- MLE: r={kal['r']:.2e}, q_alpha={kal['q_a']:.2e}, "
                   f"q_beta={kal['q_b']:.2e} (beta half-life of shocks "
@@ -365,13 +426,56 @@ def main(mode, data_dir=None):
                   f"{fe1.date() if fe1 is not None else 'never'}; CUSUM-sq "
                   f"argmax {ic['sq_break_date'].date()} (IT stat "
                   f"{ic['sq_it_stat']:.2f}, 5% iid crit ~1.36)")
-    report.append(f"- Shewhart threshold: {thr_mode} "
-                  f"(latest |z| cutoff {ic['shewhart_threshold_used']:.2f}; "
-                  f"realized flag rate {ic['shewhart_realized_rate']:.4%} "
-                  f"= {ic['shewhart_realized_rate']*252:.2f}/yr). Gaussian "
-                  f"3.5 would nominally give 0.12/yr -- a much higher "
-                  f"realized rate means the innovations are fat-tailed, "
-                  f"which is exactly why the threshold is data-calibrated.")
+    # Fat-tail diagnostic = the CUTOFF ratio at a matched tail probability,
+    # NOT the realized flag rate. Both modes pin the realized rate near the
+    # design by construction, so that rate is a readback of the config and
+    # says nothing about tail shape; the cutoff the data demands to hit that
+    # rate is the thing that varies with the tails.
+    report.append(
+        f"- Shewhart threshold: {thr_mode}/{thr_diag['estimator']}, designed "
+        f"alarm rate {thr_diag['alarm_per_year']:.2f}/yr "
+        f"(p={thr_diag['tail_p']:.2e}/day). Latest |z| cutoff "
+        f"{ic['shewhart_threshold_used']:.2f}; realized "
+        f"{ic['shewhart_realized_rate']*252:.2f}/yr (a check that the "
+        f"calibration held, not a tail test).")
+    if "tail_ratio" in thr_diag:
+        tr = thr_diag["tail_ratio"]
+        verdict = ("materially fat-tailed" if tr >= 1.25 else
+                   "mildly fat-tailed" if tr >= 1.10 else
+                   "close to Gaussian in the typical window" if tr >= 0.90 else
+                   "thinner-tailed than Gaussian in the typical window")
+        realized = ic["shewhart_realized_rate"] * 252
+        report.append(
+            f"- **Tail diagnostic**: to hit the same {thr_diag['tail_p']:.2e} "
+            f"tail the data demands |z| > {thr_diag['median_cutoff']:.2f} "
+            f"(median over refits) where a Gaussian needs "
+            f"{thr_diag['gauss_cutoff']:.2f} -- ratio {tr:.2f}x, i.e. "
+            f"innovations are {verdict}. Cross-check: the Gaussian cutoff "
+            f"{thr_diag['gauss_cutoff']:.2f} actually fires at "
+            f"{fixed_rate_realized:.2f}/yr on this sample against its nominal "
+            f"{thr_diag['alarm_per_year']:.2f}/yr.")
+        # A near-1 tail ratio together with heavy over-firing at the Gaussian
+        # cutoff cannot both be explained by tail SHAPE -- they reconcile only
+        # if the innovation scale is non-stationary. Say so, because the two
+        # numbers otherwise look contradictory and the remedy is different.
+        over = fixed_rate_realized / max(thr_diag["alarm_per_year"], 1e-9)
+        if tr < 1.10 and over >= 2.0:
+            report.append(
+                f"- **Non-stationarity, not fat tails**: the typical-window "
+                f"tail is ~Gaussian ({tr:.2f}x) yet the Gaussian cutoff "
+                f"over-fires {over:.1f}x, and the calibrated threshold still "
+                f"realizes {realized:.2f}/yr against a {thr_diag['alarm_per_year']:.2f}"
+                f"/yr design. Those reconcile only if the innovation SCALE "
+                f"shifts between regimes: |z| is well-behaved within a regime "
+                f"and clusters across regime changes. Note the circularity "
+                f"this creates -- a trailing threshold adapts UP during the "
+                f"very episode you want flagged, so treat clustered flags "
+                f"(two in five days) as the signal rather than the count, and "
+                f"lean on CUSUM-sq for the level shift itself.")
+        elif tr >= 1.10:
+            report.append(
+                f"- Calibrated threshold realizes {realized:.2f}/yr against "
+                f"the {thr_diag['alarm_per_year']:.2f}/yr design.")
     report.append(f"- flag dates (first 8): "
                   f"{[d.date() for d in ic['shewhart_dates'][:8]]}\n")
     kal["beta"].to_csv(f"{out}/kalman_beta.csv")
@@ -398,9 +502,10 @@ def main(mode, data_dir=None):
          else pd.Series(dtype=float)),
     ], axis=1).dropna(axis=1, how="all")
     hmm_pit = regimes.fit_hmm_train_filter_full(
-        feats, train_frac=0.6,
+        feats, train_frac=cfg["regimes"]["hmm_train_frac"],
         n_states_list=cfg["regimes"]["hmm_states"],
-        seeds=cfg["regimes"]["hmm_seeds"])
+        seeds=cfg["regimes"]["hmm_seeds"],
+        winsor_z=cfg["regimes"]["hmm_winsor_z"])
     if hmm_pit is not None:
         report.append(f"### HMM (fit on first 60%, filtered forward; k={hmm_pit['k']}, "
                       f"BIC={hmm_pit['bic']:.0f})")
@@ -408,7 +513,7 @@ def main(mode, data_dir=None):
         report.append("```\n" + hmm_pit["state_table"].round(4).to_string() + "\n```")
         # pick the state with the most extreme |b_cc| mean as the 'stress' regime
         tbl = hmm_pit["state_table"]
-        eligible = tbl[tbl["uncond_freq"] >= 0.02]
+        eligible = tbl[tbl["uncond_freq"] >= cfg["regimes"]["hmm_state_min_freq"]]
         stress = int(eligible["b_cc"].abs().idxmax()) \
             if "b_cc" in tbl.columns and len(eligible) else 0
         filt = hmm_pit["filtered_full_pitparams"][f"state{stress}"]
@@ -429,12 +534,15 @@ def main(mode, data_dir=None):
     dc = cfg["drift"]
     carry = drift_mod.carry_proxy(drop[ref], b_cc.index, dc["cycle_days"])
     b_ex = (b_cc - carry).rename("b_ex")
-    sig_tr = b_ex.rolling(60, min_periods=40).std()
+    sw = dc["studentize_window"]
+    sig_tr = b_ex.rolling(
+        sw, min_periods=max(2, int(sw * cfg["regimes"]["min_obs_frac"]))).std()
     ms = drift_mod.ms_mean_regimes(b_ex, k=dc["ms_k"], scale=dc["ms_scale"],
                                    sigma=sig_tr)
     seg = drift_mod.drift_segments(b_ex, min_size=dc["pelt_min_size"],
                                    pen_scale=dc["pelt_pen_scale"],
-                                   widen_t=dc["widen_tstat"], sigma=sig_tr)
+                                   widen_t=dc["widen_tstat"], sigma=sig_tr,
+                                   jump=dc["pelt_jump"])
     report.append("## Drift regimes: carry-earning vs spread-widening\n")
     report.append("Detection is on the CARRY-ADJUSTED, VOL-STUDENTIZED basis "
                   "return: carry removed so the null slope is ~0, trailing-"
@@ -451,7 +559,12 @@ def main(mode, data_dir=None):
         report.append(f"- Widening state = state {ms['widening_state']}; "
                       f"time in widening: {float((wp > 0.5).mean()):.1%}\n")
     if len(seg):
-        report.append("### Trend segments (slope table, z units/day)")
+        report.append("### Trend segments (detection in z/day; P&L in pts/day)")
+        report.append("`slope_z_per_day`/`tstat`/`label` describe the "
+                      "vol-studentized series the segmentation actually ran "
+                      "on; `slope_pts_per_day`/`cum_pts` re-express the same "
+                      "dates in price points, which is the P&L-relevant "
+                      "magnitude.")
         segp = seg.copy()
         segp["start"] = segp["start"].dt.date; segp["end"] = segp["end"].dt.date
         report.append("```\n" + segp.round(3).to_string(index=False) + "\n```\n")
@@ -463,7 +576,8 @@ def main(mode, data_dir=None):
         beta_slope = (hres["fit_B"][0.1] - hres["fit_B"][-0.1]) / 0.2
     comp = drift_mod.build_components(
         b_cc, carry, kal["beta"], hres["fit_B"][0.0], dTsy, dvol=dvol_s,
-        dYield=dYield, beta_slope_at_cc=beta_slope)
+        dYield=dYield, beta_slope_at_cc=beta_slope,
+        cc_sens=dc["cc_sens"], lam_window=dc["lam_window"])
     comp.to_csv(f"{out}/drift_components.csv")
     attr = drift_mod.attribute_episodes(comp, seg, dYield=dYield) \
         if len(seg) else pd.DataFrame()
@@ -475,7 +589,9 @@ def main(mode, data_dir=None):
         report.append("```\n" + attr.round(3).to_string(index=False) + "\n```\n")
         attr.to_csv(f"{out}/widening_attribution.csv", index=False)
     if data.get("events") is not None and wp is not None:
-        ov = drift_mod.event_overlay(data["events"], b_cc, wp)
+        ov = drift_mod.event_overlay(data["events"], b_cc, wp,
+                                     pre=dc["event_pre_days"],
+                                     post=dc["event_post_days"])
         report.append("### Event overlay")
         report.append("```\n" + ov.round(3).to_string(index=False) + "\n```\n")
 
@@ -594,8 +710,6 @@ def _plots(out, hres, kal, ic, b_panel, b_cc, ref, truth, pelt_beta, pelt_basis,
     fig, ax = plt.subplots(figsize=(11, 4))
     b_cc.cumsum().plot(ax=ax, lw=1, label="cum b_cc (quant B, PIT)")
     b_panel[ref].cumsum().plot(ax=ax, lw=1, label=f"cum basis coupon {ref}")
-    if desk is not None and ref in desk.columns:
-        pass
     if truth is not None:
         vlines(ax, [truth["break_basis_date"]], "red", "planted basis break")
     vlines(ax, pelt_basis, "purple", "PELT detected")

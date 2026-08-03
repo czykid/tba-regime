@@ -95,14 +95,14 @@ def _block_boot_idx(T, block, rng):
     idx = (starts[:, None] + np.arange(block)[None, :]) % T
     return idx.ravel()[:T]
 
-def sup_f_bootstrap(y, x, trim=0.15, B=199, block=20, seed=0):
+def sup_f_bootstrap(y, x, trim=0.15, B=199, block=20, seed=0, min_obs=120):
     """H0: constant (a,b). Bootstrap resamples (x, e_hat) in circular blocks,
     rebuilds y* under the null fit, recomputes sup-F."""
     y = np.asarray(y, float); x = np.asarray(x, float)
     mask = np.isfinite(y) & np.isfinite(x)
     y, x = y[mask], x[mask]
     T = len(y)
-    if T < 120:
+    if T < min_obs:
         return {"supF": np.nan, "p": np.nan, "break_idx": None, "n": T}
     X = np.column_stack([np.ones(T), x])
     beta, *_ = np.linalg.lstsq(X, y, rcond=None)
@@ -141,12 +141,12 @@ def nyblom(y, x):
     L = np.einsum("ti,ij,tj->", S, Vi, S) / T
     return float(L)
 
-def nyblom_bootstrap(y, x, B=199, block=20, seed=1):
+def nyblom_bootstrap(y, x, B=199, block=20, seed=1, min_obs=120):
     y = np.asarray(y, float); x = np.asarray(x, float)
     mask = np.isfinite(y) & np.isfinite(x)
     y, x = y[mask], x[mask]
     T = len(y)
-    if T < 120:
+    if T < min_obs:
         return {"L": np.nan, "p": np.nan}
     X = np.column_stack([np.ones(T), x])
     beta, *_ = np.linalg.lstsq(X, y, rcond=None)
@@ -166,12 +166,12 @@ def nyblom_bootstrap(y, x, B=199, block=20, seed=1):
 # CUSUM (recursive residuals) on the hedge regression
 # --------------------------------------------------------------------------
 
-def cusum_recursive(y, x):
+def cusum_recursive(y, x, min_obs=150):
     """Brown-Durbin-Evans CUSUM via statsmodels RecursiveLS on dP ~ dTsy.
     Tests constancy of the hedge relationship directly."""
     import statsmodels.api as sm
     df = pd.concat([pd.Series(y, name="y"), pd.Series(x, name="x")], axis=1).dropna()
-    if len(df) < 150:
+    if len(df) < min_obs:
         return {"cusum_exceed_frac": np.nan}
     X = sm.add_constant(df["x"].values)
     try:
@@ -196,7 +196,7 @@ def cusum_recursive(y, x):
 # multiple breaks via PELT (ruptures)
 # --------------------------------------------------------------------------
 
-def pelt_breaks(series, index, model="l2", min_size=90, pen_scale=3.0):
+def pelt_breaks(series, index, model="l2", min_size=90, pen_scale=3.0, jump=5):
     import ruptures as rpt
     s = pd.Series(series, index=index).dropna()
     z = (s - s.mean()) / (s.std() + 1e-12)
@@ -205,7 +205,7 @@ def pelt_breaks(series, index, model="l2", min_size=90, pen_scale=3.0):
     if T < 2 * min_size:
         return []
     pen = pen_scale * np.log(T)
-    algo = rpt.Pelt(model=model, min_size=min_size, jump=5).fit(x)
+    algo = rpt.Pelt(model=model, min_size=min_size, jump=jump).fit(x)
     bkps = algo.predict(pen=pen)
     return [s.index[b - 1] for b in bkps[:-1]]
 
@@ -214,20 +214,21 @@ def pelt_breaks(series, index, model="l2", min_size=90, pen_scale=3.0):
 # Kalman time-varying-parameter hedge beta
 # --------------------------------------------------------------------------
 
-def kalman_tvp(y, x, q_init=1e-6, estimate=True):
+def kalman_tvp(y, x, q_init=1e-6, estimate=True, init_window=60, min_obs=150):
     """State [alpha_t, beta_t] random walk; obs y_t = a_t + b_t x_t + eps.
     MLE over (log r, log q_a, log q_b) by Nelder-Mead. Returns filtered path
     and standardized one-step innovations (the online regime detector)."""
     df = pd.concat([pd.Series(y, name="y"), pd.Series(x, name="x")], axis=1).dropna()
     yy, xx = df["y"].values, df["x"].values
     T = len(yy)
-    if T < 150:
+    if T < min_obs:
         return None
 
-    # init from first 60 obs OLS
-    X0 = np.column_stack([np.ones(60), xx[:60]])
-    b0, *_ = np.linalg.lstsq(X0, yy[:60], rcond=None)
-    r0 = np.var(yy[:60] - X0 @ b0)
+    # init from first `init_window` obs OLS
+    n0 = max(10, min(int(init_window), T // 2))
+    X0 = np.column_stack([np.ones(n0), xx[:n0]])
+    b0, *_ = np.linalg.lstsq(X0, yy[:n0], rcond=None)
+    r0 = np.var(yy[:n0] - X0 @ b0)
 
     def loglik(params, ret_path=False):
         r = np.exp(params[0]); qa = np.exp(params[1]); qb = np.exp(params[2])
@@ -271,68 +272,292 @@ def kalman_tvp(y, x, q_init=1e-6, estimate=True):
     }
 
 
+def gaussian_abs_cutoff(tail_p):
+    """|z| cutoff with two-sided Gaussian exceedance probability tail_p.
+    This is the 'textbook constant' expressed as a function of the alarm rate:
+    tail_p = 4.65e-4 (0.12 flags/yr) returns 3.4906 ~ the conventional 3.5."""
+    return float(stats.norm.ppf(1.0 - tail_p / 2.0))
+
+
+def _gpd_tail_quantile(x, tail_p, q_u=0.95, min_exceed=10):
+    """Peaks-over-threshold tail quantile of |z|.
+
+    Why not a raw empirical quantile: the designed alarm rate is 0.12/yr, i.e.
+    a per-day tail of 4.65e-4, which is 1-in-2150 days. A 500-day window has
+    no order statistic out there -- asking for that quantile just returns the
+    window maximum, and the detector goes nearly silent (realized rate far
+    BELOW the design, not at it). POT fits a Generalized Pareto to exceedances
+    over a moderate threshold that IS well estimated (~25 points above the 95th
+    pct in 500 obs) and extrapolates, which is the standard way to reach a
+    quantile beyond the sample.
+
+    Moment estimator for (xi, beta) -- closed form, stable on small exceedance
+    counts where GPD MLE is erratic. Returns NaN if the fit is unusable.
+    """
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if len(x) < 50:
+        return np.nan
+    u = np.quantile(x, q_u)
+    exc = x[x > u] - u
+    if len(exc) < min_exceed:
+        return np.nan
+    m, v = exc.mean(), exc.var(ddof=1)
+    if not np.isfinite(m) or not np.isfinite(v) or m <= 0 or v <= 0:
+        return np.nan
+    xi = 0.5 * (1.0 - m * m / v)
+    beta = 0.5 * m * (1.0 + m * m / v)
+    if beta <= 0:
+        return np.nan
+    # xi >= 1 => infinite mean; the moment estimator is not valid there and the
+    # extrapolation would be meaningless. Cap into the usable range.
+    xi = float(np.clip(xi, -0.5, 0.95))
+    ratio = tail_p / (1.0 - q_u)          # P(exceed target | exceed u)
+    if ratio >= 1.0:
+        return float(np.quantile(x, 1.0 - tail_p))
+    if abs(xi) < 1e-6:
+        return float(u + beta * np.log(1.0 / ratio))
+    return float(u + (beta / xi) * (ratio ** (-xi) - 1.0))
+
+
 def empirical_shewhart_threshold(z, cal, burn=60):
-    """Threshold for |z| flags, calibrated to the data's OWN tail rather than
-    a Gaussian convention. Trailing quantile => self-adjusting to residual
-    leptokurtosis: if innovations are t-like, a fixed 3.5 fires ~10x more
-    often than its nominal rate, while the quantile holds the DESIGNED alarm
-    rate whatever the tail shape. Trailing (not full-sample) keeps it PIT.
-    Returns (threshold_series, mode_used)."""
+    """Threshold for |z| flags, calibrated to the data's OWN tail instead of a
+    Gaussian convention, at a DESIGNED alarm rate you set in config.
+
+    Both modes target the same rate, so switching mode changes the estimator
+    and not the operating point:
+      fixed      -> Gaussian cutoff for that rate (3.49 at 0.12/yr)
+      empirical  -> POT/GPD tail of trailing |z| at that rate
+
+    The cutoffs are therefore directly comparable, and their ratio is the
+    fat-tail diagnostic. (The REALIZED flag rate is not: it is pinned near the
+    design by construction in either mode, so it carries no information about
+    tail shape.)
+
+    Strictly trailing: the threshold in force on day t is fit on |z| up to
+    t-1 only. Refit every `shewhart_refit_every` days and held between refits.
+
+    CAVEAT on point-in-time-ness: the THRESHOLD is trailing, but `z` is not.
+    kalman_tvp estimates (r, q_a, q_b) by MLE over the whole sample, so the
+    innovations being thresholded already embed future information. This layer
+    cannot undo that. For a genuinely PIT alarm history the Kalman parameters
+    would have to be re-estimated on an expanding window too; as it stands,
+    treat the LIVE threshold (the last value) as tradeable and the historical
+    flag series as in-sample description.
+
+    Returns (threshold_series, mode_used, diagnostics).
+    """
+    per_year = float(cal.get("shewhart_alarm_per_year", 0.12))
+    tail_p = per_year / 252.0
+    gauss_cut = gaussian_abs_cutoff(tail_p)
+    diag = {"alarm_per_year": per_year, "tail_p": tail_p,
+            "gauss_cutoff": gauss_cut, "estimator": "gaussian"}
+
     zz = z.iloc[burn:].abs()
-    if cal.get("shewhart_mode") != "empirical" or \
-            len(zz) < cal.get("shewhart_min_window", 250):
-        return pd.Series(cal.get("shewhart_fixed", 3.5), index=z.index), "fixed"
-    w = cal.get("shewhart_window", 500)
-    q = cal.get("shewhart_quantile", 0.998)
-    thr = zz.rolling(w, min_periods=cal.get("shewhart_min_window", 250)) \
-            .quantile(q).shift(1)
-    thr = thr.reindex(z.index).ffill().fillna(cal.get("shewhart_fixed", 3.5))
-    return thr, "empirical"
+    wmin = int(cal.get("shewhart_min_window", 250))
+    if cal.get("shewhart_mode") != "empirical" or len(zz) < wmin:
+        return pd.Series(gauss_cut, index=z.index), "fixed", diag
+
+    w = int(cal.get("shewhart_window", 500))
+    q_u = float(cal.get("shewhart_pot_quantile", 0.95))
+    min_exc = int(cal.get("shewhart_min_exceed", 10))
+    stride = max(1, int(cal.get("shewhart_refit_every", 21)))
+    # Can the window read the target tail off directly? Needs min_exc order
+    # statistics beyond it. At 0.12/yr and w=500 this is False by a wide
+    # margin, so POT does the work -- but if the user dials the alarm rate up
+    # (or the window way out), the direct quantile is preferable: no model.
+    direct = (w * tail_p) >= min_exc
+    diag["estimator"] = "empirical_quantile" if direct else "pot_gpd"
+
+    v = zz.values
+    n = len(v)
+    thr_vals = np.full(n, np.nan)
+    last = np.nan
+    for t in range(n):
+        if t >= wmin and (t - wmin) % stride == 0:
+            win = v[max(0, t - w):t]          # strictly prior -> PIT
+            if direct:
+                cand = float(np.quantile(win, 1.0 - tail_p)) if len(win) else np.nan
+            else:
+                cand = _gpd_tail_quantile(win, tail_p, q_u, min_exc)
+            if np.isfinite(cand):
+                last = cand
+        thr_vals[t] = last
+
+    thr = pd.Series(thr_vals, index=zz.index)
+    # Warm-up (and any failed fit) falls back to the Gaussian cutoff for the
+    # SAME alarm rate, so the operating point is continuous across the join.
+    thr = thr.reindex(z.index).ffill().fillna(gauss_cut)
+    fitted = thr_vals[np.isfinite(thr_vals)]
+    if len(fitted):
+        diag["latest_cutoff"] = float(fitted[-1])
+        diag["median_cutoff"] = float(np.median(fitted))
+        diag["tail_ratio"] = float(np.median(fitted) / gauss_cut)
+        diag["n_refits"] = int(len(np.unique(np.round(fitted, 6))))
+    return thr, "empirical", diag
 
 
-def calibrate_pelt_penalty(series, cal, min_size, model="l2", seed=0):
+def calibrate_pelt_penalty(series, cal, min_size, model="l2", seed=0, jump=5):
     """Choose the PELT penalty by SIMULATING THE NULL instead of trusting
-    pen = c*log(T). Circular-block bootstrap destroys any break structure
-    while preserving the serial correlation (critical: 60d rolling betas are
-    ~59/60 overlapping, so an uncalibrated penalty over-detects wildly).
+    pen = c*log(T), which is a modelling convention carrying no error-rate
+    guarantee and which over-detects badly on persistent series.
+
     Returns the smallest penalty whose family-wise false-alarm rate is at or
-    below target -- smallest because that maximizes power subject to the
-    error constraint. Also returns the achieved rate for the report."""
+    below target -- smallest because that maximizes power subject to the error
+    constraint. `jump` must match the value used in the real pelt_breaks call,
+    or the null is being segmented at a different resolution than the data.
+
+    Returns (pen_scale, achieved_rate, mode, diagnostics)."""
     import ruptures as rpt
     s = pd.Series(series).dropna()
     T = len(s)
     if cal.get("pelt_mode") != "empirical" or T < 4 * min_size:
-        return None, None, "fixed"
+        return None, None, "fixed", {}
     z = ((s - s.mean()) / (s.std() + 1e-12)).values
     rng = np.random.default_rng(seed)
-    B = cal.get("pelt_boot_B", 99)
-    block = max(min_size // 2, 20)
+    B = int(cal.get("pelt_boot_B", 400))
+    block = int(cal.get("pelt_boot_block", max(min_size, 120)))
+    block = max(2, min(block, max(2, T // 4)))
+    null_kind = cal.get("pelt_null", "difference")
     grid = sorted(cal.get("pelt_pen_grid", [1.0, 2.0, 3.0, 6.0]))
     counts = {p: 0 for p in grid}
-    # coarse-to-fine: once a replicate is clean at penalty p it is clean at
-    # every larger p (PELT is monotone in the penalty), so ascend the grid
-    # and stop at the first clean level for that replicate.
+    n_ok = 0
+    logT = np.log(T)
+
+    # AR-sieve setup: fit once, resample residuals per replicate.
+    ar_p = int(cal.get("pelt_ar_order", 2))
+    phi = res_ar = None
+    if null_kind == "ar_sieve" and T > 10 * ar_p:
+        Xa = np.column_stack([z[ar_p - 1 - k: T - 1 - k] for k in range(ar_p)])
+        ya = z[ar_p:]
+        try:
+            phi, *_ = np.linalg.lstsq(Xa, ya, rcond=None)
+            res_ar = ya - Xa @ phi
+        except np.linalg.LinAlgError:
+            phi = res_ar = None
+    if phi is None and null_kind == "ar_sieve":
+        null_kind = "difference"          # fall back if the AR fit failed
+
+    def _draw():
+        """One no-break replicate.
+
+        The null has to reproduce how hard the series WANDERS without
+        containing any break, and the three options trade off differently:
+
+        'level'     -- block-resample the levels. WRONG for a persistent
+                       series: chunks are drawn from unrelated levels and
+                       every seam is a genuine mean shift, so the null
+                       arrives pre-loaded with the breaks it exists to
+                       exclude, and the penalty is pushed up by an artifact.
+
+        'difference'-- resample increments and cumulate. Seam-free, but it
+                       imposes an EXACT unit root. A mean-reverting series
+                       gets replaced by a true random walk, which wanders
+                       more than the truth, so the penalty is pushed up
+                       again -- just for the opposite reason.
+
+        'ar_sieve'  -- (default) simulate from an AR(p) fitted to the series
+                       with block-resampled residuals. Persistence is
+                       estimated rather than assumed, so a near-unit-root
+                       series gets a near-unit-root null and a mean-reverting
+                       one does not. The block on the residuals still carries
+                       the ~59/60 window overlap.
+        """
+        if null_kind == "ar_sieve":
+            e_idx = _block_boot_idx(len(res_ar), block, rng)
+            e = res_ar[e_idx]
+            path = np.empty(T)
+            s0 = rng.integers(0, T - ar_p)
+            path[:ar_p] = z[s0:s0 + ar_p]
+            for i in range(ar_p, T):
+                # lags most-recent-first, matching the column order of the
+                # design matrix phi was fitted on. Sliced forward then
+                # reversed: the `i-1 : i-1-p : -1` form silently underflows
+                # to an empty slice on the first step when i-1-p == -1.
+                path[i] = phi @ path[i - ar_p:i][::-1] + e[(i - ar_p) % len(e)]
+        elif null_kind == "difference":
+            d = np.diff(z)
+            if len(d) < block:
+                return None
+            idx = _block_boot_idx(len(d), block, rng)
+            path = np.concatenate([[0.0], np.cumsum(d[idx])])
+        else:
+            path = z[_block_boot_idx(T, block, rng)]
+        sd = path.std()
+        if not np.isfinite(sd) or sd <= 0 or not np.isfinite(path).all():
+            return None
+        # rescale to unit variance: pelt_breaks standardizes the REAL series
+        # before applying the penalty, so the null must be on the same scale
+        # or the calibrated penalty means something different in use.
+        return ((path - path.mean()) / sd).reshape(-1, 1)
+
+    # Monotonicity: the optimal segmentation's changepoint count is
+    # non-increasing in the penalty, so once a replicate is clean at p it is
+    # clean at every larger p -- ascend and stop at the first clean level.
+    # This makes `counts` non-increasing in p by construction, so the rate
+    # curve crosses the target at most once, AND it means a penalty skipped
+    # because a smaller one was already clean is genuinely clean (not missing
+    # data), so the counts stay exact.
+    #
+    # Pruning: a penalty whose dirty count has already exceeded target*B can
+    # never meet the target, and by monotonicity neither can anything below
+    # it. Advancing a floor past those is what makes B=400 affordable -- the
+    # small penalties are dirty on nearly every replicate, so they are both
+    # the most expensive to evaluate (no early break) and the first to be
+    # disqualified.
+    target = float(cal.get("pelt_target_fa", 0.05))
+    budget = target * B
+    lo = 0
     for _ in range(B):
-        idx = _block_boot_idx(T, block, rng)
-        xb = z[idx].reshape(-1, 1)
+        if lo >= len(grid):
+            break               # every penalty on the grid is disqualified
+        xb = _draw()
+        if xb is None:
+            continue
         try:
             algo = rpt.Pelt(model=model, min_size=min_size,
-                            jump=cal.get("jump", 5)).fit(xb)
+                            jump=jump).fit(xb)
         except Exception:
             continue
-        for p in grid:
+        hit = {}
+        failed = False
+        for p in grid[lo:]:
             try:
-                if len(algo.predict(pen=p * np.log(T))) - 1 > 0:
-                    counts[p] += 1
-                else:
-                    break   # monotone: all larger penalties also clean
+                hit[p] = (len(algo.predict(pen=p * logT)) - 1) > 0
             except Exception:
-                pass
-    target = cal.get("pelt_target_fa", 0.05)
-    rates = {p: counts[p] / max(B, 1) for p in grid}
-    ok = [p for p in grid if rates[p] <= target]
+                failed = True
+                break
+            if not hit[p]:
+                break           # monotone: all larger penalties also clean
+        if failed:
+            continue            # drop the whole replicate; never score it as clean
+        n_ok += 1
+        for p, dirty in hit.items():
+            if dirty:
+                counts[p] += 1
+        while lo < len(grid) and counts[grid[lo]] > budget:
+            lo += 1
+
+    if n_ok == 0:
+        return None, None, "fixed", {"n_ok": 0}
+    # Rates over the whole grid. For penalties below the disqualification
+    # floor the count stopped accumulating, so those are LOWER bounds -- fine,
+    # since all we ever needed from them was "above target".
+    rates = {p: counts[p] / n_ok for p in grid}
+    ok = [p for p in grid[lo:] if rates[p] <= target]
+    exhausted = not ok
     chosen = min(ok) if ok else max(grid)
-    return chosen, rates.get(chosen), "empirical"
+    diag = {
+        "n_ok": n_ok, "block": block, "null": null_kind,
+        "rates": rates, "n_disqualified": lo,
+        "se": float(np.sqrt(max(target * (1 - target), 1e-12) / n_ok)),
+        "at_grid_top": exhausted,
+        "ar_order": ar_p if null_kind == "ar_sieve" else None,
+    }
+    # Never return None for the rate: when the grid is exhausted the rate at
+    # the top penalty is a lower bound, and the caller must be able to print
+    # it. `at_grid_top` is what says "this did not meet target".
+    return chosen, float(rates[chosen]), "empirical", diag
 
 
 def innovation_cusum(z, a=0.948, burn=60, threshold=None):
@@ -374,11 +599,12 @@ def innovation_cusum(z, a=0.948, burn=60, threshold=None):
 # multivariate Gaussian HMM (filtered probabilities for signal use)
 # --------------------------------------------------------------------------
 
-def fit_hmm(features, n_states_list=(2, 3), seeds=(0, 1, 2, 3, 4)):
+def fit_hmm(features, n_states_list=(2, 3), seeds=(0, 1, 2, 3, 4), winsor_z=5.0):
     from hmmlearn.hmm import GaussianHMM
     F = features.dropna()
     Xz = (F - F.mean()) / F.std()
-    Xz = Xz.clip(-5, 5)  # winsorize: stop EM spending a state on one outlier day
+    # winsorize: stop EM spending a state on one outlier day
+    Xz = Xz.clip(-abs(winsor_z), abs(winsor_z))
     X = Xz.values
     T, d = X.shape
     best = None
@@ -468,7 +694,12 @@ def fit_hmm_train_filter_full(features, train_frac=0.6, **kw):
     if fit is None:
         return None
     mu, sd = F.iloc[:n_tr].mean(), F.iloc[:n_tr].std()
-    Xfull = ((F - mu) / sd).values
+    # Clip to the SAME winsorization the parameters were estimated under. The
+    # emission covariances never saw |z| beyond this, so an unclipped outlier
+    # gets a wildly negative logpdf and pins the filter on one state for days
+    # -- a false regime flag manufactured by a preprocessing mismatch.
+    wz = abs(kw.get("winsor_z", 5.0))
+    Xfull = ((F - mu) / sd).clip(-wz, wz).values
     filt = _forward_filtered(fit["model"], Xfull)
     filt = pd.DataFrame(filt, index=F.index,
                         columns=[f"state{i}" for i in range(fit["k"])])
@@ -496,17 +727,20 @@ def hysteresis_signal(filtered_prob, enter=0.8, exit=0.2):
 # --------------------------------------------------------------------------
 
 def vol_beta_regime(basis_ret, dvol, cfg):
-    w = cfg["regimes"]["vol_beta_window"]
+    rc = cfg["regimes"]
+    w = rc["vol_beta_window"]
+    mo = max(2, int(w * rc.get("min_obs_frac", 0.75)))
     df = pd.concat([basis_ret.rename("b"), dvol.rename("dv")], axis=1).dropna()
-    roll_beta = df["b"].rolling(w, min_periods=int(w * 0.75)).cov(df["dv"]) / \
-        df["dv"].rolling(w, min_periods=int(w * 0.75)).var()
+    roll_beta = df["b"].rolling(w, min_periods=mo).cov(df["dv"]) / \
+        df["dv"].rolling(w, min_periods=mo).var()
     battery = sup_f_bootstrap(df["b"].values, df["dv"].values,
-                              trim=cfg["regimes"]["supF_trim"],
-                              B=cfg["regimes"]["boot_B"],
-                              block=cfg["regimes"]["boot_block"])
+                              trim=rc["supF_trim"], B=rc["boot_B"],
+                              block=rc["boot_block"],
+                              min_obs=rc.get("min_obs_break_test", 120))
     if battery["break_idx"] is not None:
         battery["break_date"] = df.index[battery["break_idx"]]
     breaks = pelt_breaks(roll_beta, roll_beta.index, model="l2",
-                         min_size=cfg["regimes"]["pelt_min_size"],
-                         pen_scale=cfg["regimes"]["pelt_pen_scale"])
+                         min_size=rc["pelt_min_size"],
+                         pen_scale=rc["pelt_pen_scale"],
+                         jump=rc.get("pelt_jump", 5))
     return {"rolling_beta": roll_beta, "supF": battery, "pelt_break_dates": breaks}

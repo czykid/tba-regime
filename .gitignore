@@ -7,3 +7,4 @@ data/
 !requirements.txt
 .DS_Store
 .venv/
+run_log.txt

@@ -104,11 +104,19 @@ def ms_mean_regimes(b_ex, k=2, scale=100.0, sigma=None):
 # --------------------------------------------------------------------------
 
 def drift_segments(b_ex, min_size=40, pen_scale=2.0, widen_t=-1.0,
-                   sigma=None):
+                   sigma=None, jump=2):
     """PELT mean-shift on returns == piecewise-linear slopes on the level.
     Returns a dated slope table; a segment is labelled 'widening' when its
-    per-day mean is negative with t-stat below widen_t."""
+    per-day mean is negative with t-stat below widen_t.
+
+    Units: when `sigma` is supplied the detection series is vol-studentized,
+    so segment slopes are in SIGMA PER DAY, not price points. Both are
+    reported -- slope_z_per_day is what the t-stat and the label refer to;
+    slope_pts_per_day re-expresses the same segment in points using the raw
+    (unstudentized) series over the same dates, which is the number that
+    means anything for P&L."""
     import ruptures as rpt
+    raw = b_ex
     if sigma is not None:
         b_ex = (b_ex / sigma.shift(1)).replace([np.inf, -np.inf], np.nan)
     s = b_ex.dropna()
@@ -116,7 +124,7 @@ def drift_segments(b_ex, min_size=40, pen_scale=2.0, widen_t=-1.0,
     T = len(z)
     if T < 2 * min_size:
         return pd.DataFrame()
-    algo = rpt.Pelt(model="l2", min_size=min_size, jump=2).fit(z)
+    algo = rpt.Pelt(model="l2", min_size=min_size, jump=jump).fit(z)
     bkps = algo.predict(pen=pen_scale * np.log(T))
     rows, start = [], 0
     for b in bkps:
@@ -125,9 +133,13 @@ def drift_segments(b_ex, min_size=40, pen_scale=2.0, widen_t=-1.0,
         t = mu / (sd / np.sqrt(n) + 1e-12)
         label = ("widening" if (mu < 0 and t < widen_t)
                  else ("carry" if (mu > 0 and t > -widen_t) else "flat"))
+        seg_raw = raw.loc[seg.index[0]:seg.index[-1]].dropna()
+        mu_pts = float(seg_raw.mean()) if len(seg_raw) else np.nan
         rows.append({"start": seg.index[0], "end": seg.index[-1], "days": n,
-                     "slope_pts_per_day": mu, "tstat": t, "label": label,
-                     "cum_pts": mu * n})
+                     "slope_z_per_day": mu, "tstat": t, "label": label,
+                     "cum_z": mu * n,
+                     "slope_pts_per_day": mu_pts,
+                     "cum_pts": mu_pts * len(seg_raw) if len(seg_raw) else np.nan})
         start = b
     return pd.DataFrame(rows)
 

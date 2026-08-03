@@ -46,7 +46,6 @@ def compute_current_coupon(front, coupon_step=0.5):
         c = r.index.values.astype(float); p = r.values
         order = np.argsort(c); c, p = c[order], p[order]
         if (p >= 100).any() and (p <= 100).any():
-            i = np.where(p >= 100)[0][-1] if p[0] >= 100 else np.where(p <= 100)[0][0]
             # find bracketing pair around 100
             j = None
             for k in range(len(p) - 1):
@@ -143,7 +142,8 @@ def rolling_node_betas(dS, dTsy, cfg):
     """60d rolling OLS beta of node changes on Treasury price changes.
     Vectorized via rolling moments. Trailing-only."""
     hc = cfg["hedge"]
-    w, mo = hc["reg_window"], hc["min_obs"]
+    w = hc["reg_window"]
+    mo = hc.get("min_obs") or max(2, int(w * cfg["regimes"].get("min_obs_frac", 0.75)))
     x = dTsy.reindex(dS.index)
     betas = pd.DataFrame(index=dS.index, columns=dS.columns, dtype=float)
     r2 = pd.DataFrame(index=dS.index, columns=dS.columns, dtype=float)
@@ -252,7 +252,15 @@ def production_ratio_check(prod, ratio_A, ratio_B):
     """If the desk exports the PRODUCTION quant ratios, this settles the
     Variant A/B question empirically: correlations, mean abs differences,
     and a pooled horse race prod ~ A + B. Whichever variant production loads
-    on tells you whether the composition-effect critique applies to it."""
+    on tells you whether the composition-effect critique applies to it.
+
+    Read the horse-race loadings with care: A and B are near-collinear by
+    construction (same regressions, same nodes, differing only in the
+    composition effect), so the INDIVIDUAL coefficients are unstable and can
+    flip sign on small samples. The robust readings are corr_prod_* and
+    mad_prod_*; the loadings are only decisive when one is near 1 and the
+    other near 0. The pooled fit also stacks coupons without fixed effects,
+    so cross-coupon level differences load onto the constant."""
     common_c = [c for c in prod.columns if c in ratio_A.columns]
     frames = []
     for c in common_c:

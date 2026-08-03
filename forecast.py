@@ -54,11 +54,17 @@ def walk_forward(features, target, cfg):
     cols_vl = [c for c in features.columns if c.startswith("dvol")] + cols_ar
 
     cached = {}
+    last_fit = None
     for t in range(min_train, T):
         train_end = t - h - emb
         if train_end < 100:
             continue
-        if (t - min_train) % refit == 0 or t - 1 not in cached:
+        # Refit on cadence, and always on the first usable t. The previous
+        # condition tested `t - 1 not in cached`, i.e. whether an INTEGER was
+        # a key of a dict keyed by model names -- never true, so the cadence
+        # was dead and this refit every single day.
+        if last_fit is None or (t - last_fit) >= refit:
+            last_fit = t
             ytr = df["y"].values[:train_end]
             cached = {"mean": ytr.mean()}
             for name, cols in (("ar", cols_ar), ("regime_cond", cols_rg),

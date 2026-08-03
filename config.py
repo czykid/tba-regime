@@ -97,19 +97,73 @@ CONFIG = {
     },
 
     # ---------------- empirical calibration ----------------
-    # Replaces textbook constants with thresholds calibrated to YOUR data's
-    # own tails / null behaviour. Each has a "fixed" fallback.
+    # Thresholds calibrated to YOUR data's own tails / null behaviour rather
+    # than to a textbook constant.
+    #
+    # Both Shewhart modes are parameterised by the SAME quantity -- the alarm
+    # rate you are willing to run -- so switching mode changes the ESTIMATOR,
+    # never the operating point. 'fixed' derives its cutoff from that rate
+    # under normality; 'empirical' derives it from the observed tail. The two
+    # are therefore directly comparable, and their RATIO is the fat-tail
+    # diagnostic (see shewhart_tail_ratio in the report).
     "calibration": {
-        "shewhart_mode": "empirical",   # 'empirical' | 'fixed'
-        "shewhart_fixed": 3.5,          # Gaussian-convention fallback
-        "shewhart_quantile": 0.998,     # trailing quantile of |z| (~1/2yr)
-        "shewhart_window": 500,         # trailing obs for the quantile
-        "shewhart_min_window": 250,     # below this, use fixed
-        "pelt_mode": "empirical",       # 'empirical' | 'fixed'
-        "pelt_target_fa": 0.05,         # P(>=1 spurious break) under the null
-        "pelt_boot_B": 40,              # bootstrap reps (penalty search is O(B*|grid|))
-        "pelt_pen_grid": [1.0, 2.0, 3.0, 6.0, 12.0, 20.0, 40.0, 80.0, 160.0],
-        "report_realized_rates": True,  # print achieved exceedance rates
+        "shewhart_mode": "empirical",     # 'empirical' | 'fixed'
+        "shewhart_alarm_per_year": 0.12,  # designed false-alarm rate. 0.12/yr
+                                          # == the |z|>3.5 Gaussian convention
+                                          # (P=4.65e-4/day x 252), so this
+                                          # default preserves the incumbent
+                                          # operating point exactly.
+        "shewhart_window": 500,           # trailing obs the tail is fit on
+        "shewhart_min_window": 250,       # below this, use the Gaussian cutoff
+        "shewhart_pot_quantile": 0.95,    # POT threshold: exceedances above
+                                          # this feed the GPD tail fit
+        "shewhart_min_exceed": 10,        # need >= this many order statistics
+                                          # ABOVE the target tail to read it off
+                                          # directly; otherwise extrapolate by
+                                          # POT/GPD (a 0.12/yr tail needs ~21k
+                                          # obs to read directly -- so with a
+                                          # 500d window this is the normal path)
+        "shewhart_refit_every": 21,       # refit the tail every N days and hold
+                                          # (still strictly trailing/PIT)
+
+        "pelt_mode": "empirical",         # 'empirical' | 'fixed'
+        "pelt_target_fa": 0.05,           # P(>=1 spurious break) under the null
+        "pelt_boot_B": 200,               # reps. SE at a 5% target is
+                                          # sqrt(.05*.95/B): 1.5% at B=200,
+                                          # but 3.4% at B=40 -- coarser than
+                                          # the target itself. Cost is roughly
+                                          # linear in B; pruning keeps it sane.
+        "pelt_null": "ar_sieve",          # 'ar_sieve' | 'difference' | 'level'
+                                          # How to build a no-break series that
+                                          # wanders as hard as the real one:
+                                          #  level      - splices unrelated
+                                          #    levels; every seam IS a mean
+                                          #    shift, so the null manufactures
+                                          #    the breaks it should exclude.
+                                          #  difference - seam-free but imposes
+                                          #    an exact unit root, so a
+                                          #    mean-reverting series is
+                                          #    replaced by a random walk.
+                                          #  ar_sieve   - fits AR(p) and
+                                          #    resamples residuals, so
+                                          #    persistence is ESTIMATED, not
+                                          #    assumed either way. Default.
+        "pelt_ar_order": 2,               # p for the AR sieve
+        "pelt_boot_block": 120,           # block length. Must exceed the
+                                          # overlap of the series being tested
+                                          # (60d rolling beta => MA(60) in the
+                                          # increments), else the resample
+                                          # destroys the dependence it exists
+                                          # to preserve.
+        # Grid must reach high enough for a persistent series to find control.
+        # Validation on simulated paths (n=1750, l2, min_size=90): iid noise
+        # selects 2 (i.e. it REPRODUCES the textbook c*log(T) when the textbook
+        # is right), AR(1)=0.98 selects 80, AR(1)=0.999 selects 320. A grid
+        # topping out at 160 would have hit the ceiling on the last of those
+        # and reported a false-alarm rate above target.
+        "pelt_pen_grid": [1.0, 2.0, 3.0, 6.0, 12.0, 20.0, 40.0, 80.0,
+                          160.0, 320.0, 640.0, 1280.0, 2560.0, 5120.0],
+        "report_realized_rates": True,    # print achieved exceedance rates
     },
 
     "outdir": "outputs",
